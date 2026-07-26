@@ -3,10 +3,10 @@
 // @name:zh-CN   知乎增强
 // @name:zh-TW   知乎增強
 // @name:ru      Улучшение Zhihu
-// @version      2.3.30
+// @version      2.3.31
 // @author       X.I.U
 // @description  A more personalized Zhihu experience~
-// @description:zh-CN  移除登录弹窗、屏蔽指定类别（视频、盐选、文章、想法、关注[赞同/关注了XX]等）、屏蔽低赞/低评、屏蔽用户、屏蔽关键词、默认收起回答、快捷收起回答/评论（左键两侧）、快捷回到顶部（右键两侧）、区分问题文章、移除高亮链接、净化搜索热门、净化标题消息、展开问题描述、显示问题作者、默认高清原图（无水印）、置顶显示时间、完整问题时间、直达问题按钮、默认站外直链...
+// @description:zh-CN  移除登录弹窗、屏蔽指定类别（视频、盐选、文章、想法、关注[赞同/关注了XX]等）、屏蔽低赞/低评、屏蔽用户、屏蔽关键词、默认收起回答、快捷收起回答/评论（左键两侧）、快捷回到顶部（右键两侧）、区分问题文章、移除高亮链接、净化搜索热门、净化标题消息、展开问题描述、显示问题作者、默认高清原图（无水印）、置顶显示时间、完整问题时间、直达问题按钮、默认站外直链、显示已拉黑/被拉黑标记...
 // @description:zh-TW  移除登錄彈窗、屏蔽指定類別（視頻、鹽選、文章、想法、關注[贊同/關注了XX]等）、屏蔽低贊/低評、屏蔽用戶、屏蔽關鍵詞、默認收起回答、快捷收起回答/評論、快捷回到頂部、區分問題文章、移除高亮鏈接、默認高清原圖（無水印）、默認站外直鏈...
 // @description:ru  Более персонализированный опыт пользования сайтом Zhihu~
 // @match        *://www.zhihu.com/*
@@ -66,7 +66,9 @@ var menu_ALL = [
     ['menu_publishTop', '置顶显示时间', '置顶显示时间', true],
     ['menu_typeTips', '区分问题文章', '区分问题文章', true],
     ['menu_toQuestion', '直达问题按钮', '直达问题按钮', true],
-    ['menu_markOnlyVisibleToMyself', '标记仅自己可见的评论', '标记仅自己可见的评论（接口返回 is_visible_only_to_myself 为 true）', true]
+    ['menu_markOnlyVisibleToMyself', '标记仅自己可见的评论', '标记仅自己可见的评论（接口返回 is_visible_only_to_myself 为 true）', true],
+    ['menu_showBlockedLabel', '显示已拉黑标记', '在已拉黑用户的用户名后显示 [已拉黑] 标记', true],
+    ['menu_showBlockedByLabel', '显示被拉黑标记', '在被拉黑的用户的用户名后显示 [被拉黑] 标记', true]
 ], menu_ID = [];
 for (let i=0;i<menu_ALL.length;i++){ // 如果读取到的值为 null 就写入默认值
     if (GM_getValue(menu_ALL[i][0]) == null){GM_setValue(menu_ALL[i][0], menu_ALL[i][3])};
@@ -296,7 +298,9 @@ function collapsedAnswer() {
 function collapsedNowAnswer(selectors) {
     backToTop(selectors) // 快捷回到顶部
     if (!menu_value('menu_collapsedNowAnswer')) return
-    document.querySelector(selectors).onclick = function(event){
+    var el = document.querySelector(selectors);
+    if (!el) return;
+    el.onclick = function(event){
         if (event.target == this) {
             // 下面这段主要是 [收起回答]，顺便 [收起评论]（如果展开了的话）
             let rightButton = document.querySelector('.ContentItem-actions.Sticky.RichContent-actions.is-fixed.is-bottom')
@@ -420,7 +424,9 @@ function collapsedNowAnswer(selectors) {
 // 回到顶部（监听点击事件，鼠标右键点击网页两侧空白处）
 function backToTop(selectors) {
     if (!menu_value('menu_backToTop')) return
-    document.querySelector(selectors).oncontextmenu = function(event){
+    var el = document.querySelector(selectors);
+    if (!el) return;
+    el.oncontextmenu = function(event){
         if (event.target == this) {
             event.preventDefault();
             window.scrollTo(0,0)
@@ -1812,6 +1818,229 @@ function markOnlyVisibleToMyself() {
 // -----------------------------------------------------------------------------
 
 
+// ====== 已拉黑 / 被拉黑标记功能 ======
+// 缓存 [被拉黑] 状态，避免重复请求知乎 API
+var zhihuE_blockedByCache = {};
+
+// [被拉黑] API 请求队列，控制并发避免浏览器连接数耗尽
+var zhihuE_blockedByQueue = [];
+var zhihuE_blockedByTimer = null;
+
+// 从链接中提取用户 urlToken
+function zhihuE_getUserToken(link) {
+    const match = link.href && link.href.match(/\/people\/([^/?&]+)/);
+    return match ? match[1] : null;
+}
+
+// 从链接中提取纯用户名（排除已添加的标记元素）
+function zhihuE_getUsernameFromLink(link) {
+    let name = '';
+    for (const node of link.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            name += node.textContent;
+        } else if (node.nodeType === Node.ELEMENT_NODE && !node.classList.contains('zhihuE-blockedBadge') && !node.classList.contains('zhihuE-blockedByBadge')) {
+            name += node.textContent;
+        }
+    }
+    return name.trim();
+}
+
+// 检查用户名是否在屏蔽列表中
+function zhihuE_isUserBlocked(username) {
+    const users = menu_value('menu_customBlockUsers');
+    if (!users || users.length < 1) return false;
+    return users.some(function(u) { return u === username; });
+}
+
+// 异步检测用户是否拉黑了我（通过知乎 API，带请求队列避免并发爆发）
+// [被拉黑] = 对方把我拉黑了，对应 API 字段 is_blocked
+// 测试验证：is_blocking = 我拉黑对方（主动），is_blocked = 对方拉黑我（被动）
+function zhihuE_checkBlockedBy(token, callback) {
+    // 已缓存则直接返回
+    if (zhihuE_blockedByCache.hasOwnProperty(token)) {
+        callback(zhihuE_blockedByCache[token]);
+        return;
+    }
+    // 已在队列中等待，避免重复入队
+    if (zhihuE_blockedByQueue.some(function(item) { return item[0] === token; })) {
+        return;
+    }
+    // 入队：标记为 "pending" 占位，让同一 token 的后续调用走缓存
+    zhihuE_blockedByCache[token] = {blocking: false, blocked: false};
+    zhihuE_blockedByQueue.push([token, callback]);
+
+    // 启动队列处理（如果尚未启动）
+    if (!zhihuE_blockedByTimer) {
+        zhihuE_processBlockedByQueue();
+    }
+}
+
+// 逐个处理请求队列，间隔 300ms 避免触发频率限制
+function zhihuE_processBlockedByQueue() {
+    if (zhihuE_blockedByQueue.length === 0) {
+        zhihuE_blockedByTimer = null;
+        return;
+    }
+    const item = zhihuE_blockedByQueue.shift();
+    const token = item[0];
+    const callback = item[1];
+
+    GM_xmlhttpRequest({
+        url: 'https://www.zhihu.com/api/v4/members/' + token + '?include=is_blocked,is_blocking',
+        method: 'GET',
+        timeout: 5000,
+        onload: function(resp) {
+            try {
+                const data = JSON.parse(resp.responseText);
+                // is_blocking：我正在拉黑对方（主动），is_blocked：对方拉黑了我（被动）
+                var result = {
+                    blocking: data.is_blocking === true, // 我把对方拉黑了 → 已拉黑
+                    blocked: data.is_blocked === true     // 对方把我拉黑了 → 被拉黑
+                };
+                zhihuE_blockedByCache[token] = result;
+                if (result.blocked) console.log('[知乎增强] 检测到被拉黑：', token, data.name || '', '（该用户已将你拉黑）');
+                if (result.blocking) console.log('[知乎增强] API 检测到已拉黑：', token, data.name || '', '（你已拉黑该用户）');
+                callback(result);
+            } catch(e) {
+                zhihuE_blockedByCache[token] = {blocking: false, blocked: false};
+                callback({blocking: false, blocked: false});
+            }
+        },
+        onerror: function() {
+            zhihuE_blockedByCache[token] = {blocking: false, blocked: false};
+            callback({blocking: false, blocked: false});
+        },
+        ontimeout: function() {
+            zhihuE_blockedByCache[token] = {blocking: false, blocked: false};
+            callback({blocking: false, blocked: false});
+        }
+    });
+
+    // 下一个请求间隔 300ms
+    zhihuE_blockedByTimer = setTimeout(zhihuE_processBlockedByQueue, 300);
+}
+
+// 为用户名链接添加拉黑标记
+function zhihuE_labelUserLink(link) {
+    if (link.classList.contains('zhihuE-labeled')) return;
+    link.classList.add('zhihuE-labeled');
+
+    const token = zhihuE_getUserToken(link);
+    if (!token) return;
+
+    const username = zhihuE_getUsernameFromLink(link);
+    if (!username || /^\d+$/.test(username)) return; // 过滤纯数字或空用户名
+
+    // [已拉黑]：该用户已被我拉黑（本地屏蔽列表检测）
+    if (menu_value('menu_showBlockedLabel') && zhihuE_isUserBlocked(username)) {
+        if (!link.querySelector('.zhihuE-blockedBadge')) {
+            var badge1 = document.createElement('span');
+            badge1.className = 'zhihuE-blockedBadge';
+            badge1.textContent = '已拉黑';
+            badge1.title = '你已将该用户拉黑（本地列表）';
+            link.appendChild(badge1);
+            console.log('[知乎增强] 本地列表检测到已拉黑：', username);
+        }
+    }
+
+    // API 检测（被拉黑 + 已拉黑补充检测）
+    if (menu_value('menu_showBlockedByLabel') || menu_value('menu_showBlockedLabel')) {
+        // 如果该链接两种标记都已存在，跳过 API 请求
+        var hasBlockedBadge = link.querySelector('.zhihuE-blockedBadge');
+        var hasBlockedByBadge = link.querySelector('.zhihuE-blockedByBadge');
+        if (hasBlockedBadge && (hasBlockedByBadge || !menu_value('menu_showBlockedByLabel'))) return;
+        if (hasBlockedByBadge && (hasBlockedBadge || !menu_value('menu_showBlockedLabel'))) return;
+
+        zhihuE_checkBlockedBy(token, function(result) {
+            if (!result) return;
+            // 匹配该用户的所有链接：href 包含 token 且带有 zhihuE-labeled 标记
+            var links = document.querySelectorAll('a.zhihuE-labeled[href*="/people/' + token + '"]');
+
+            // [被拉黑]：对方把我拉黑了 → is_blocked
+            if (menu_value('menu_showBlockedByLabel') && result.blocked) {
+                links.forEach(function(l) {
+                    if (!l.querySelector('.zhihuE-blockedByBadge')) {
+                        var badge = document.createElement('span');
+                        badge.className = 'zhihuE-blockedByBadge';
+                        badge.textContent = '被拉黑';
+                        badge.title = '该用户已将你拉黑';
+                        l.appendChild(badge);
+                    }
+                });
+            }
+
+            // [已拉黑] 补充：本地列表遗漏的，通过 API is_blocking 补上
+            if (menu_value('menu_showBlockedLabel') && result.blocking) {
+                links.forEach(function(l) {
+                    if (!l.querySelector('.zhihuE-blockedBadge')) {
+                        var badge = document.createElement('span');
+                        badge.className = 'zhihuE-blockedBadge';
+                        badge.textContent = '已拉黑';
+                        badge.title = '你已将该用户拉黑（API 检测）';
+                        l.appendChild(badge);
+                    }
+                });
+            }
+        });
+    }
+}
+
+// 设置已拉黑/被拉黑标记的观察器（主入口）
+function setupBlockedLabels() {
+    if (!menu_value('menu_showBlockedLabel') && !menu_value('menu_showBlockedByLabel')) return;
+
+    console.log('[知乎增强] 已启动拉黑标记功能 | 已拉黑(我把对方拉黑)：' + menu_value('menu_showBlockedLabel') + ' | 被拉黑(对方把我拉黑)：' + menu_value('menu_showBlockedByLabel') + ' | 本地屏蔽列表：' + (menu_value('menu_customBlockUsers') || []).length + ' 人');
+
+    // 注入样式
+    if (!document.getElementById('zhihuE-blockedLabelStyle')) {
+        const style = document.createElement('style');
+        style.id = 'zhihuE-blockedLabelStyle';
+        style.textContent = '.zhihuE-blockedBadge{display:inline-block;margin-left:4px;padding:0 4px;font-size:12px;line-height:18px;border-radius:3px;color:#e03a3a;background:#e03a3a1a;font-weight:normal;vertical-align:middle;white-space:nowrap;}.zhihuE-blockedByBadge{display:inline-block;margin-left:4px;padding:0 4px;font-size:12px;line-height:18px;border-radius:3px;color:#d4a017;background:#d4a0171a;font-weight:normal;vertical-align:middle;white-space:nowrap;}';
+        document.head.appendChild(style);
+    }
+
+    // 扫描现有用户名链接
+    function scanExisting() {
+        document.querySelectorAll('a[href*="/people/"]:not(.zhihuE-labeled)').forEach(function(link) {
+            const username = zhihuE_getUsernameFromLink(link);
+            if (!username || /^\d+$/.test(username)) return;
+            zhihuE_labelUserLink(link);
+        });
+    }
+
+    scanExisting();
+
+    // 监听动态加载的内容
+    const observer = new MutationObserver(function(mutationsList) {
+        for (const mutation of mutationsList) {
+            for (const target of mutation.addedNodes) {
+                if (target.nodeType != 1) continue;
+                if (target.matches && target.matches('a[href*="/people/"]:not(.zhihuE-labeled)')) {
+                    const username = zhihuE_getUsernameFromLink(target);
+                    if (username && !(/^\d+$/.test(username))) {
+                        zhihuE_labelUserLink(target);
+                    }
+                }
+                if (target.querySelectorAll) {
+                    target.querySelectorAll('a[href*="/people/"]:not(.zhihuE-labeled)').forEach(function(link) {
+                        const username = zhihuE_getUsernameFromLink(link);
+                        if (username && !(/^\d+$/.test(username))) {
+                            zhihuE_labelUserLink(link);
+                        }
+                    });
+                }
+            }
+        }
+    });
+    observer.observe(document, { childList: true, subtree: true });
+
+    // URL 变化时重新扫描
+    window.addEventListener('urlchange', function() {
+        setTimeout(scanExisting, 800);
+    });
+}
+// ====== 已拉黑 / 被拉黑标记功能 END ======
+
 (function() {
     if (window.onurlchange === undefined) {addUrlChangeEvent();} // Tampermonkey v4.11 版本添加的 onurlchange 事件 grant，可以监控 pjax 等网页的 URL 变化
     rememberSelectedBlockKeyword(); // 记录当前选中的文字，供右键脚本菜单直接加入屏蔽词
@@ -1839,6 +2068,7 @@ function markOnlyVisibleToMyself() {
         closeFloatingComments(); //                                            快捷关闭悬浮评论（监听点击事件，点击网页两侧空白处）
         blockKeywords('comment'); //                                           屏蔽指定关键词（评论）
         markOnlyVisibleToMyself(); //                                          标记仅自己可见的评论
+        setupBlockedLabels(); //                                               已拉黑/被拉黑标记
 
 
         if (location.pathname.indexOf('question') > -1 && location.href.indexOf('/log') == -1) { //       回答页 //
